@@ -1,29 +1,24 @@
-ColumnLimit: 100
+ColumnLimit: 120
 
 UseTab: Never
 IndentWidth: 4
 AccessModifierOffset: -4
-#AlignAfterOpenBracket: AlwaysBreak
-AlignConsecutiveAssignments: true
-AlignConsecutiveDeclarations: true
-AlignConsecutiveMacros: true
-AlignEscapedNewlines: Right
+AlignEscapedNewlines: Left
 AlignOperands: true
 AlignTrailingComments: true
 AllowAllArgumentsOnNextLine: true
-AllowAllConstructorInitializersOnNextLine: true
 AllowAllParametersOfDeclarationOnNextLine: true
 AllowShortBlocksOnASingleLine: Empty
 AllowShortCaseLabelsOnASingleLine: true
 AllowShortFunctionsOnASingleLine: Empty
 AllowShortIfStatementsOnASingleLine: Never
-AllowShortLoopsOnASingleLine: true
+AllowShortLoopsOnASingleLine: false
 AllowShortLambdasOnASingleLine: Inline
 BinPackArguments: false
 BinPackParameters: false
 
 BraceWrapping:
-  AfterNamespace: true
+  AfterNamespace: false
   AfterEnum: false
   AfterStruct: false
   AfterClass: false
@@ -37,7 +32,6 @@ BraceWrapping:
 BreakBeforeBraces: Custom
 AlwaysBreakTemplateDeclarations: Yes
 BreakConstructorInitializers: AfterColon
-ConstructorInitializerAllOnOneLineOrOnePerLine: true
 Cpp11BracedListStyle: true
 FixNamespaceComments: true
 IndentPPDirectives: BeforeHash

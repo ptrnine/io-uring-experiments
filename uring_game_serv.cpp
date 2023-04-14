@@ -1,12 +1,14 @@
+#include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <thread>
 
 #include <iostream>
-#include <sys/mman.h>
-#include <netinet/in.h>
 #include <liburing.h>
+#include <netinet/in.h>
+#include <sys/mman.h>
 
 int setup_sock(uint16_t port) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -31,7 +33,7 @@ struct printf_debug_handler {
     void operator()(auto&&... args) const {
         fprintf(stderr, args...);
     }
-    operator bool() const noexcept {
+    constexpr operator bool() const noexcept {
         return true;
     }
 };
@@ -45,27 +47,40 @@ enum sqe_op : uint64_t {
     sqe_op_sendmsg,
 };
 
-template <typename F = printf_debug_handler>
+struct uring_settings {
+    uint32_t sq_depth = 32;
+    uint32_t cq_multiplier = 8;
+    uint32_t batch_size_multiplier = 2;
+    uint32_t buf_size = 4096;
+};
+
+template <auto V>
+struct type_c {};
+
+template <uring_settings settings, typename RH, typename DH = printf_debug_handler>
 class io_uring_ctx {
 public:
-    io_uring_ctx(uint32_t isq_depth      = 256,
-                 uint32_t ibatch_size    = 2048,
-                 uint32_t ibuf_shift     = 12,
-                 F        idebug_handler = printf_debug_handler{}):
-        sq_depth(isq_depth), batch_size(ibatch_size), buf_shift(12), debug_handler(idebug_handler) {
+    static constexpr auto sq_depth = settings.sq_depth;
+    static constexpr auto cq_depth = sq_depth * settings.cq_multiplier;
+    static constexpr auto batch_size = cq_depth * settings.batch_size_multiplier;
+    static constexpr auto buf_size = settings.buf_size;
+    static constexpr auto buf_ring_size = (sizeof(io_uring_buf) + buf_size) * batch_size;
+
+    io_uring_ctx(type_c<settings>, RH receive_handler, DH debug_handler = printf_debug_handler{}):
+        receive_h(std::move(receive_handler)), debug(std::move(debug_handler)) {
         setup();
     }
 
     int register_files(int* fds, unsigned int count) {
         int rc = io_uring_register_files(&ring, fds, count);
-        if (debug_handler && rc)
-            debug_handler("register file failed: %s", strerror(-rc));
+        if (rc)
+            debug("register file failed: %s\n", strerror(-rc));
         return rc;
     }
 
     void add_recv_request(int idx) {
-        auto sqe = next_sqe();
-        io_uring_prep_recvmsg_multishot(sqe, idx, &_msg, MSG_TRUNC);
+        io_uring_sqe* sqe = next_sqe();
+        io_uring_prep_recvmsg_multishot(sqe, idx, &msg, MSG_TRUNC);
         sqe->flags |= IOSQE_FIXED_FILE;
         sqe->flags |= IOSQE_BUFFER_SELECT;
         sqe->buf_group = 0;
@@ -73,23 +88,21 @@ public:
     }
 
     void run() {
-        io_uring_cqe* cqes[batch_size];
-        add_recv_request(0);
-
         while (true) {
-            auto rc = io_uring_submit_and_wait(&ring, 1);
             add_recv_request(0);
-            if (rc == -EINTR)
+            auto rc = io_uring_submit_and_wait(&ring, 1);
+            if (rc == -EINTR) {
+                fprintf(stderr, "EINTR\n");
                 continue;
+            }
 
             if (rc < 0) {
-                if (debug_handler)
-                    debug_handler("io_uring_submit_and_wait() failed: %d\n", rc);
+                debug("io_uring_submit_and_wait() failed: %d\n", rc);
                 break;
             }
 
-            auto count = io_uring_peek_batch_cqe(&ring, cqes, batch_size);
-            printf("batch count: %u\n", count);
+            auto count = io_uring_peek_batch_cqe(&ring, cqes, cq_depth /* batch_size */);
+            //fprintf(stderr, "batch: %zu\n", count);
             for (size_t i = 0; i < count; ++i)
                 rc = process_cqe(cqes[i], 0);
 
@@ -98,19 +111,15 @@ public:
         }
     }
 
-    uint32_t buffer_size() {
-        return 1U << buf_shift;
-    }
-
     uint8_t* buffer(size_t idx) {
-        return buf_base + (idx << buf_shift);
+        return ((uint8_t*)buf_ring + sizeof(io_uring_buf) * batch_size) + idx * buf_size;
     }
 
 private:
     void setup() {
         io_uring_params params = {
-            .cq_entries = sq_depth * 8,
-            .flags      = IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_CQSIZE,
+            .cq_entries = cq_depth,
+            .flags = IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_CQSIZE,
         };
         auto rc = io_uring_queue_init_params(sq_depth, &ring, &params);
         if (rc < 0)
@@ -126,42 +135,33 @@ private:
     }
 
     void setup_buffer() {
-        io_uring_buf_reg reg = {
-            .ring_addr    = 0,
-            .ring_entries = batch_size,
-            .bgid         = 0,
-        };
-
-        buf_ring_size = (sizeof(io_uring_buf) + buffer_size()) * batch_size;
-        buf_ring = (io_uring_buf_ring*)mmap(
-            nullptr, buf_ring_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+        buf_ring =
+            (io_uring_buf_ring*)mmap(nullptr, buf_ring_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
         if (buf_ring == MAP_FAILED)
             throw std::runtime_error("buffer ring mmap failed: " + std::string(strerror(errno)));
 
         io_uring_buf_ring_init(buf_ring);
 
-        reg = io_uring_buf_reg{
+        io_uring_buf_reg reg = {
             .ring_addr = (uint64_t)buf_ring,
             .ring_entries = batch_size,
             .bgid = 0,
         };
-        buf_base = (uint8_t*)buf_ring + sizeof(io_uring_buf) * batch_size;
 
         auto rc = io_uring_register_buf_ring(&ring, &reg, 0);
         if (rc)
             throw std::runtime_error("buffer ring init failed: " + std::string(strerror(-rc)));
 
         for (uint16_t i = 0; i < batch_size; ++i)
-            io_uring_buf_ring_add(
-                buf_ring, buffer(i), buffer_size(), i, io_uring_buf_ring_mask(batch_size), i);
+            io_uring_buf_ring_add(buf_ring, buffer(i), buf_size, i, io_uring_buf_ring_mask(batch_size), i);
 
         buf_ring_advance(int(batch_size));
     }
 
-    void ring_recycle(size_t idx) {
+    void buf_ring_recycle(size_t idx) {
         io_uring_buf_ring_add(buf_ring,
                               buffer(idx),
-                              buffer_size(),
+                              buf_size,
                               uint16_t(idx),
                               io_uring_buf_ring_mask(batch_size),
                               0);
@@ -172,22 +172,54 @@ private:
     }
 
     io_uring_sqe* next_sqe() {
-        auto sqe = io_uring_get_sqe(&ring);
-        if (!sqe) {
-            if (debug_handler)
-                debug_handler("cannot get SQE: SQ is full, trying submit it to get next SQE...\n");
-            io_uring_submit(&ring);
-            sqe = io_uring_get_sqe(&ring);
-        }
-        if (!sqe && debug_handler)
-                debug_handler("cannot get SQE\n");
-        return sqe;
+        if (auto sqe = io_uring_get_sqe(&ring))
+            return sqe;
+
+        debug("cannot get SQE: SQ is full, trying submit it to get next SQE...\n");
+        io_uring_submit(&ring);
+
+        if (auto sqe = io_uring_get_sqe(&ring))
+            return sqe;
+
+        debug("cannot get SQE\n");
+        return nullptr;
     }
 
     struct buf_scope {
+        buf_scope(): ctx(nullptr) {}
+
+        buf_scope(uint8_t* ipayload, size_t ilen, size_t iidx, io_uring_ctx* ictx):
+            payload(ipayload), len(ilen), idx(iidx), ctx(ictx) {}
+
+        buf_scope(buf_scope&& bs) noexcept: payload(bs.payload), len(bs.len), idx(bs.idx), ctx(bs.ctx) {
+            bs.ctx = nullptr;
+        }
+
+        buf_scope& operator=(buf_scope&& bs) noexcept {
+            if (&bs == this)
+                return *this;
+
+            payload = bs.payload;
+            len = bs.len;
+            idx = bs.idx;
+            ctx = bs.ctx;
+            bs.ctx = nullptr;
+            return *this;
+        }
+
         ~buf_scope() {
-            ctx->ring_recycle(idx);
-            ctx->buf_ring_advance(1);
+            if (ctx) {
+                ctx->buf_ring_recycle(idx);
+                ctx->buf_ring_advance(1);
+            }
+        }
+
+        const uint8_t* data() const {
+            return payload;
+        }
+
+        size_t size() const {
+            return len;
         }
 
         uint8_t*      payload;
@@ -196,46 +228,39 @@ private:
         io_uring_ctx* ctx;
     };
 
-    int process_cqe_recv(io_uring_cqe* cqe, int fdidx) {
+    int process_cqe_recv(io_uring_cqe* cqe, int /*fdidx*/) {
         if (cqe->res == -ENOBUFS) {
-            if (debug_handler)
-                debug_handler("no buffers available\n");
+            debug("no buffers available\n");
             return 0;
         }
 
         if (!(cqe->flags & IORING_CQE_F_BUFFER) || cqe->res < 0) {
-            if (debug_handler)
-                debug_handler("recv CQE have a bad res: %d\n", cqe->res);
+            debug("recv CQE have a bad res: %d\n", cqe->res);
             return -55;
         }
         auto idx = cqe->flags >> 16;
 
-        auto out = io_uring_recvmsg_validate(buffer(idx), cqe->res, &_msg);
+        io_uring_recvmsg_out* out = io_uring_recvmsg_validate(buffer(idx), cqe->res, &msg);
         if (!out) {
-            if (debug_handler)
-                debug_handler("bad recvmsg\n");
+            debug("bad recvmsg\n");
             return -2;
         }
 
-        auto payload_len = io_uring_recvmsg_payload_length(out, cqe->res, &_msg);
+        auto payload_len = io_uring_recvmsg_payload_length(out, cqe->res, &msg);
         if (out->flags & MSG_TRUNC) {
-            if (debug_handler)
-                debug_handler("truncated msg need %u received %u\n", out->payloadlen, payload_len);
-            ring_recycle(idx);
+            debug("truncated msg need %u received %u\n", out->payloadlen, payload_len);
+            buf_ring_recycle(idx);
             buf_ring_advance(1);
             return 0;
         }
 
-        ++_metrics.packets_received;
+        auto payload = io_uring_recvmsg_payload(out, &msg);
+        auto src = (sockaddr_in*)io_uring_recvmsg_name(out);
 
-        auto payload = io_uring_recvmsg_payload(out, &_msg);
+        receive_h(src, buf_scope{(uint8_t*)payload, payload_len, idx, this});
 
-        printf("received: %lu\n", _metrics.packets_received);
-
-        buf_scope sc{(uint8_t*)payload, payload_len, idx, this};
-
-        ring_recycle(idx);
-        buf_ring_advance(1);
+        //ring_recycle(idx);
+        //buf_ring_advance(1);
 
         return 0;
     }
@@ -247,24 +272,75 @@ private:
     }
 
 private:
-    unsigned int sq_depth;
-    unsigned int batch_size;
-    unsigned int buf_shift;
-    uint8_t* buf_base;
-
     io_uring ring = {};
-    size_t buf_ring_size;
     io_uring_buf_ring* buf_ring;
+    io_uring_cqe* cqes[cq_depth];
 
+    msghdr msg = {.msg_namelen = sizeof(sockaddr_in)};
 
-    msghdr _msg = {};
-    F debug_handler;
+    RH receive_h;
+    DH debug;
+};
 
-    metrics_store _metrics;
+#include "rigtorp/SPSCQueue.h"
+
+template <typename T>
+class worker {
+public:
+    struct data {
+        sockaddr_in src;
+        T buf;
+    };
+
+    worker() {
+        t = std::thread(&worker::run, this);
+    }
+
+    ~worker() {
+        t.join();
+    }
+
+    void push(sockaddr_in src, T&& data) {
+        spsc.emplace(src, std::move(data));
+    }
+
+    void run() {
+        while (true) {
+            auto data = spsc.front();
+            if (!data) {
+                std::this_thread::yield();
+                //std::this_thread::sleep_for(std::chrono::microseconds(5));
+                continue;
+            }
+
+            char str[INET_ADDRSTRLEN + 1] = {0};
+            inet_ntop(AF_INET, &data->src.sin_addr, str, sizeof(str));
+            printf("ipaddr: %s:%i\n", str, ntohs(data->src.sin_port));
+            printf("receive: %.*s\n", int(data->buf.size()), data->buf.data());
+
+            ++metrics.packets_received;
+            if (metrics.packets_received % 1000 == 0)
+                fprintf(stderr, "received: %zu\n", metrics.packets_received);
+
+            spsc.pop();
+        }
+    }
+
+    static worker& instance() {
+        static worker w;
+        return w;
+    }
+
+private:
+    rigtorp::SPSCQueue<data> spsc{512};
+    std::thread t;
+    metrics_store metrics;
 };
 
 int main() {
-    io_uring_ctx<> ctx(256, 4096, 16);
+    io_uring_ctx ctx(type_c<uring_settings{}>{}, [&](sockaddr_in* src, auto&& buf) {
+        worker<std::remove_reference_t<decltype(buf)>>::instance().push(*src, std::move(buf));
+    });
 
     auto sockfd = setup_sock(1337);
     if (sockfd == -1) {
