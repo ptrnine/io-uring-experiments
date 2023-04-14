@@ -1,0 +1,39 @@
+#!/bin/bash
+
+curdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+
+take_greater_version() {
+    for i in $(find "$1" -path "*/$2"); do
+        printf '%s' "$i "
+        echo "$i" | tr -dc '0-9'
+        echo ""
+    done | sort -k2 -n -r | head -n1 | cut -d " " -f1
+}
+
+fix_compodb() {
+    local include_name
+    for include_name in 'iostream' 'bits/c++config.h'; do
+        local ipath="$(take_greater_version '/usr/include' "$include_name")"
+        ipath="${ipath%/$include_name}"
+        sed -i "s|\"command\":[ \t]\+\"[a-zA-Z+/]\+|& -isystem $ipath|g" "$curdir/compile_commands.json"
+    done
+
+    # Replace -std=gnu++23 because clangd cannot recognize that
+    sed -i "s/-std=gnu++23/-std=c++2b/g" ./compile_commands.json
+}
+
+down_with_error() {
+    echo -e "Error: $1"
+    exit 1
+}
+
+builddir="$1"
+shift
+
+[ -z "$builddir" ] && down_with_error "Missing build dir argument"
+[ ! -d "$builddir" ] && down_with_error "Build directory does not exist"
+
+cmake "$curdir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -B "$builddir" "$@" &> /dev/null || down_with_error "CMake command failed"
+yes | cp -f "$builddir"/compile_commands.json "$curdir" &> /dev/null
+
+fix_compodb
